@@ -59,9 +59,88 @@ Duration: 266.65 seconds
 Da das System nun dreistufig aufgebaut ist, können Sie Updates wie folgt einspielen:
 1. **Lokal bearbeiten:** Sie ändern z. B. das Standardmodell in der Datei `proxy.py` lokal auf Ihrem PC.
 2. **GitHub Push:** Sie committen und pushen die Änderung in Ihr GitHub-Repository.
-3. **Server Pull & Neustart:** Sie verbinden sich mit dem Server und führen in PowerShell aus:
-   ```powershell
+3. **Server Pull & Neustart:** Sie verbinden sich mit dem Server und führen in der Eingabeaufforderung / PowerShell aus:
+   ```cmd
    git -C C:\AI-Tools\VM-Server pull
-   Restart-ScheduledTask -TaskName AutoGenProxy
+   schtasks /end /tn AutoGenProxy
+   schtasks /run /tn AutoGenProxy
    ```
-   *(Das lässt sich bei Bedarf über ein einfaches Skript automatisieren).*
+
+---
+
+## 5. Telegram-Bot Integration & Konfiguration
+
+Der Telegram-Bot wurde direkt asynchron in den Proxy integriert. Er läuft im selben Prozess wie der FastAPI-Webservice, sodass keine separate Windows-Aufgabe benötigt wird.
+
+### Einrichtungsschritte:
+
+1. **Bot erstellen:**
+   - Suchen Sie `@BotFather` in Telegram und senden Sie `/newbot`.
+   - Folgen Sie den Anweisungen, um einen Namen und Benutzernamen festzulegen.
+   - Kopieren Sie das generierte **HTTP API-Token** (z. B. `123456789:ABCdefGh...`).
+
+2. **Token auf dem Server hinterlegen:**
+   - Erstellen oder bearbeiten Sie die Datei `C:\AI-Tools\VM-Server\.env` auf dem Server.
+   - Fügen Sie Ihr Token hinzu:
+     ```env
+     TELEGRAM_BOT_TOKEN=Ihr_Telegram_Token_Hier
+     ```
+
+3. **Dienst neu starten:**
+   - Führen Sie auf dem Server folgende Befehle aus:
+     ```cmd
+     schtasks /end /tn AutoGenProxy
+     schtasks /run /tn AutoGenProxy
+     ```
+
+4. **Sicherheit / Chat-ID autorisieren (Whitelisting):**
+   - Starten Sie den Chat mit Ihrem neuen Bot in Telegram und senden Sie `/start` (oder eine beliebige Nachricht).
+   - Der Bot wird den Zugriff verweigern und Ihnen Ihre persönliche **Chat-ID** anzeigen (z. B. `987654321`).
+   - Fügen Sie diese ID in der Datei `.env` auf dem Server hinzu:
+     ```env
+     TELEGRAM_BOT_TOKEN=Ihr_Telegram_Token_Hier
+     TELEGRAM_ALLOWED_USERS=987654321
+     ```
+     *(Mehrere IDs können mit Komma getrennt werden: `123456789,987654321`)*
+   - Starten Sie den Dienst erneut über `schtasks` neu. Nun ist der Bot für Sie einsatzbereit!
+
+---
+
+## 6. Spezielle Chat-Befehle (Telegram)
+
+Wir haben eine Reihe nützlicher Befehle direkt im Telegram-Bot implementiert. Diese werden vom Proxy abgefangen und sofort ausgeführt, ohne dass Rechenzeit bei Ollama verbraucht wird:
+
+* `/start` : Zeigt eine Willkommensnachricht und die Liste aller verfügbaren Befehle an.
+* `/model [qwen|gemma|llama]` : Ermöglicht den schnellen Modellwechsel direkt im Chat.
+  - `/model qwen` -> Aktiviert das schnelle `qwen2.5:3b` (Standard)
+  - `/model gemma` -> Aktiviert das stärkere `gemma2:9b`
+  - `/model llama` -> Aktiviert das kompakte `llama3.2:3b`
+* `/remember [Fakt]` : Speichert eine persönliche Information im Langzeitgedächtnis (gesichert in [memory.json](file:///C:/Users/sts/.gemini/antigravity/playground/quantum-oort/memory.json) auf dem Server).
+  - *Beispiel:* `/remember Ich arbeite am ZEW in der IT-Abteilung`
+  - Diese Information wird bei jeder nachfolgenden Anfrage dem LLM als Hintergrundkontext mitgegeben.
+* `/forget` : Löscht alle über Ihre Chat-ID gespeicherten Fakten aus dem Gedächtnis des Bots.
+* `/info` : Zeigt das aktuell ausgewählte Modell und alle über Sie im Gedächtnis gespeicherten Fakten an.
+
+---
+
+## 7. Lokale Werkzeug-Bibliothek (`tools.py`)
+
+Um die Fehlerquote bei der Generierung von Dateioperationen (wie Excel/CSV) zu minimieren, haben wir eine Hilfsbibliothek [tools.py](file:///C:/Users/sts/.gemini/antigravity/playground/quantum-oort/tools.py) bereitgestellt.
+
+Diese wird beim Start des Proxys automatisch in das Ausführungsverzeichnis (`C:\AI-Tools\AutoGen\coding\tools.py`) kopiert, sodass das LLM sie in generiertem Python-Code importieren kann.
+
+### Verfügbare Funktionen in `tools.py`:
+
+1. **`tools.write_csv(data: list[dict], filename: str) -> None`**
+   - Schreibt eine Liste von Python-Dictionaries in eine UTF-8 CSV-Datei.
+   - Verhindert Kodierungsfehler unter Windows durch automatisches Erzwingen von UTF-8.
+2. **`tools.read_csv(filename: str) -> list[dict]`**
+   - Liest eine UTF-8 CSV-Datei und gibt sie als Liste von Dictionaries zurück.
+3. **`tools.write_excel(data: list[dict], filename: str) -> None`**
+   - Schreibt eine Liste von Dictionaries in eine Excel-Datei (nutzt `pandas` und `openpyxl`).
+4. **`tools.read_excel(filename: str) -> list[dict]`**
+   - Liest eine Excel-Datei und konvertiert sie zurück in eine Liste von Dictionaries (konvertiert `NaN` automatisch in Python-kompatible `None`-Werte).
+
+Das Modell ist im System-Prompt angewiesen, für jeglichen Excel- oder CSV-Dateizugriff ausschließlich diese Funktionen zu verwenden. Das reduziert die Codegröße auf 2–3 Zeilen und vermeidet Umlaut-Fehler komplett.
+
+
