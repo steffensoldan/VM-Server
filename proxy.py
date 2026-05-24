@@ -8,6 +8,8 @@ import time
 import sys
 import re
 import subprocess
+import importlib
+import inspect
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -80,6 +82,22 @@ def clear_memory_for_chat(chat_id: str):
         except Exception:
             pass
 
+def get_tools_description() -> str:
+    try:
+        if "tools" in sys.modules:
+            importlib.reload(sys.modules["tools"])
+        import tools
+        functions = inspect.getmembers(tools, inspect.isfunction)
+        tools_desc = []
+        for name, func in functions:
+            if not name.startswith("_"):
+                sig = inspect.signature(func)
+                doc = inspect.getdoc(func) or "No description available."
+                tools_desc.append(f"- tools.{name}{sig} : {doc}")
+        return "\n".join(tools_desc) if tools_desc else "Keine Tools verfügbar."
+    except Exception as e:
+        return f"Fehler beim Laden der Tools: {e}"
+
 def extract_code_block(text: str) -> str | None:
     match = re.search(r"```python\s*(.*?)\s*```", text, re.DOTALL)
     return match.group(1).strip() if match else None
@@ -111,6 +129,8 @@ async def run_agent_loop(messages: list, model: str, chat_id: str = "global"):
     if facts:
         memory_context = "\n\nFacts you remembered about this user:\n" + "\n".join(f"- {f}" for f in facts)
 
+    tools_desc = get_tools_description()
+
     system_msg = (
         "You are a helpful assistant. If you need to write files, run calculations, "
         "or process data, write Python code inside a markdown code block starting with ```python and ending with ```. "
@@ -121,11 +141,9 @@ async def run_agent_loop(messages: list, model: str, chat_id: str = "global"):
         "Always specify encoding='utf-8' when reading or writing files in Python to prevent errors. "
         "Specify the full code, and make sure it prints the outputs you want to see.\n\n"
         "You have a custom helper library 'tools.py' available. You can import it with 'import tools'. "
-        "ALWAYS use the following functions from 'tools' when reading or writing CSV/Excel files:\n"
-        "- tools.write_csv(data: list[dict], filename: str) -> None : Writes a list of dicts to a UTF-8 CSV file.\n"
-        "- tools.read_csv(filename: str) -> list[dict] : Reads a UTF-8 CSV file and returns a list of dicts.\n"
-        "- tools.write_excel(data: list[dict], filename: str) -> None : Writes a list of dicts to an Excel file.\n"
-        "- tools.read_excel(filename: str) -> list[dict] : Reads an Excel file and returns a list of dicts."
+        "ALWAYS use the functions from 'tools' when reading or writing CSV/Excel files. "
+        "Here are the available functions:\n"
+        f"{tools_desc}"
         f"{memory_context}"
     )
     
@@ -228,7 +246,8 @@ async def handle_telegram_command(client: httpx.AsyncClient, url: str, chat_id: 
             "- `/model [qwen|gemma|llama]` : Wechselt das aktive Modell für diesen Chat.\n"
             "- `/remember [Fakt]` : Speichert eine Information in Ihrem Gedächtnis.\n"
             "- `/forget` : Löscht alle gespeicherten Fakten über Sie.\n"
-            "- `/info` : Zeigt das aktuelle Modell und Ihr geladenes Gedächtnis an.\n\n"
+            "- `/info` : Zeigt das aktuelle Modell und Ihr geladenes Gedächtnis an.\n"
+            "- `/tools` : Listet alle verfügbaren Programmier-Werkzeuge auf.\n\n"
             f"Standardmodell: `{DEFAULT_MODEL}`"
         )
         await client.post(f"{url}/sendMessage", json={"chat_id": chat_id, "text": welcome, "parse_mode": "Markdown"})
@@ -272,6 +291,11 @@ async def handle_telegram_command(client: httpx.AsyncClient, url: str, chat_id: 
         )
         await client.post(f"{url}/sendMessage", json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"})
         
+    elif cmd == "/tools":
+        tools_desc = get_tools_description()
+        msg = f"🛠️ **Verfügbare Tools in `tools.py`:**\n\n{tools_desc}"
+        await client.post(f"{url}/sendMessage", json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"})
+
     else:
         msg = "Unbekannter Befehl. Senden Sie `/start` für eine Liste der Befehle."
         await client.post(f"{url}/sendMessage", json={"chat_id": chat_id, "text": msg})
