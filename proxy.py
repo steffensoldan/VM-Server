@@ -188,7 +188,7 @@ async def handle_telegram_message(client: httpx.AsyncClient, url: str, chat_id: 
     # Send status message
     status_msg_response = await client.post(
         f"{url}/sendMessage", 
-        json={"chat_id": chat_id, "text": "Ich verarbeite Ihre Anfrage... (Code-Ausführung möglich, bitte warten)"}
+        json={"chat_id": chat_id, "text": "Currently flying..."}
     )
     status_msg_id = status_msg_response.json().get("result", {}).get("message_id") if status_msg_response.status_code == 200 else None
     
