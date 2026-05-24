@@ -26,6 +26,7 @@ app.add_middleware(
 
 ollama_client = ollama.AsyncClient(host="http://localhost:11434")
 DEFAULT_MODEL = "qwen2.5:3b"
+telegram_models = {}
 
 def load_dotenv():
     env_path = Path(__file__).parent / ".env"
@@ -42,6 +43,42 @@ def is_user_allowed(chat_id: int) -> bool:
         return False
     allowed_ids = [int(x.strip()) for x in allowed_users_str.split(",") if x.strip().isdigit()]
     return chat_id in allowed_ids
+
+def get_memory_for_chat(chat_id: str) -> list[str]:
+    memory_path = Path(__file__).parent / "memory.json"
+    if not memory_path.exists():
+        return []
+    try:
+        data = json.loads(memory_path.read_text(encoding="utf-8"))
+        return data.get(str(chat_id), [])
+    except Exception:
+        return []
+
+def save_memory_for_chat(chat_id: str, fact: str):
+    memory_path = Path(__file__).parent / "memory.json"
+    data = {}
+    if memory_path.exists():
+        try:
+            data = json.loads(memory_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    chat_id_str = str(chat_id)
+    if chat_id_str not in data:
+        data[chat_id_str] = []
+    if fact not in data[chat_id_str]:
+        data[chat_id_str].append(fact)
+    memory_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def clear_memory_for_chat(chat_id: str):
+    memory_path = Path(__file__).parent / "memory.json"
+    if memory_path.exists():
+        try:
+            data = json.loads(memory_path.read_text(encoding="utf-8"))
+            if str(chat_id) in data:
+                del data[str(chat_id)]
+            memory_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
 
 def extract_code_block(text: str) -> str | None:
     match = re.search(r"```python\s*(.*?)\s*```", text, re.DOTALL)
@@ -67,16 +104,29 @@ def run_python_code(code: str) -> str:
     except Exception as e:
         return f"Fehler bei der Ausführung: {str(e)}"
 
-async def run_agent_loop(messages: list, model: str):
+async def run_agent_loop(messages: list, model: str, chat_id: str = "global"):
+    # Load memory
+    facts = get_memory_for_chat(chat_id)
+    memory_context = ""
+    if facts:
+        memory_context = "\n\nFacts you remembered about this user:\n" + "\n".join(f"- {f}" for f in facts)
+
     system_msg = (
         "You are a helpful assistant. If you need to write files, run calculations, "
         "or process data, write Python code inside a markdown code block starting with ```python and ending with ```. "
         "The system will execute your code automatically and return the console output to you. "
         "IMPORTANT: You do NOT have internet access. Do not write Python code that attempts to "
         "fetch web pages, scrape websites, or call external web APIs. All operations must be "
-        "performed completely locally using standard libraries or pre-installed packages. "
+        "performed completely locally.\n\n"
         "Always specify encoding='utf-8' when reading or writing files in Python to prevent errors. "
-        "Specify the full code, and make sure it prints the outputs you want to see."
+        "Specify the full code, and make sure it prints the outputs you want to see.\n\n"
+        "You have a custom helper library 'tools.py' available. You can import it with 'import tools'. "
+        "ALWAYS use the following functions from 'tools' when reading or writing CSV/Excel files:\n"
+        "- tools.write_csv(data: list[dict], filename: str) -> None : Writes a list of dicts to a UTF-8 CSV file.\n"
+        "- tools.read_csv(filename: str) -> list[dict] : Reads a UTF-8 CSV file and returns a list of dicts.\n"
+        "- tools.write_excel(data: list[dict], filename: str) -> None : Writes a list of dicts to an Excel file.\n"
+        "- tools.read_excel(filename: str) -> list[dict] : Reads an Excel file and returns a list of dicts."
+        f"{memory_context}"
     )
     
     ollama_messages = [{"role": "system", "content": system_msg}]
@@ -114,7 +164,7 @@ async def chat_completions(request: Request):
     stream = body.get("stream", False)
     
     if not stream:
-        final_content, usage = await run_agent_loop(openai_messages, model)
+        final_content, usage = await run_agent_loop(openai_messages, model, "global")
         return {
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion",
@@ -133,7 +183,7 @@ async def chat_completions(request: Request):
             yield f"data: {json.dumps(initial_chunk)}\n\n"
             await asyncio.sleep(0.05)
             
-            final_content, usage = await run_agent_loop(openai_messages, model)
+            final_content, usage = await run_agent_loop(openai_messages, model, "global")
             
             words = final_content.split(" ")
             for i, word in enumerate(words):
@@ -166,6 +216,66 @@ async def get_models():
         ]
     }
 
+async def handle_telegram_command(client: httpx.AsyncClient, url: str, chat_id: int, text: str):
+    parts = text.strip().split(" ", 1)
+    cmd = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if cmd == "/start":
+        welcome = (
+            "🤖 **Willkommen beim VM-Server Chatbot!**\n\n"
+            "Folgende Befehle stehen zur Verfügung:\n"
+            "- `/model [qwen|gemma|llama]` : Wechselt das aktive Modell für diesen Chat.\n"
+            "- `/remember [Fakt]` : Speichert eine Information in Ihrem Gedächtnis.\n"
+            "- `/forget` : Löscht alle gespeicherten Fakten über Sie.\n"
+            "- `/info` : Zeigt das aktuelle Modell und Ihr geladenes Gedächtnis an.\n\n"
+            f"Standardmodell: `{DEFAULT_MODEL}`"
+        )
+        await client.post(f"{url}/sendMessage", json={"chat_id": chat_id, "text": welcome, "parse_mode": "Markdown"})
+        
+    elif cmd == "/model":
+        model_arg = arg.lower()
+        if "gemma" in model_arg:
+            telegram_models[chat_id] = "gemma2:9b"
+            msg = "Modell gewechselt zu `gemma2:9b`."
+        elif "qwen" in model_arg:
+            telegram_models[chat_id] = "qwen2.5:3b"
+            msg = "Modell gewechselt zu `qwen2.5:3b`."
+        elif "llama" in model_arg:
+            telegram_models[chat_id] = "llama3.2:3b"
+            msg = "Modell gewechselt zu `llama3.2:3b`."
+        else:
+            msg = "Verfügbare Modelle: `qwen` (Qwen 2.5 3B), `gemma` (Gemma 2 9B), `llama` (Llama 3.2 3B). Beispiel: `/model gemma`"
+        await client.post(f"{url}/sendMessage", json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"})
+        
+    elif cmd == "/remember":
+        if not arg:
+            msg = "Bitte geben Sie einen Fakt an, den ich mir merken soll. Beispiel: `/remember Ich bin ZEW-Mitarbeiter`"
+        else:
+            save_memory_for_chat(str(chat_id), arg)
+            msg = f"✅ Gemerkt: *{arg}*"
+        await client.post(f"{url}/sendMessage", json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"})
+        
+    elif cmd == "/forget":
+        clear_memory_for_chat(str(chat_id))
+        msg = "🗑️ Alle gespeicherten Fakten über Sie wurden gelöscht."
+        await client.post(f"{url}/sendMessage", json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"})
+        
+    elif cmd == "/info":
+        current_model = telegram_models.get(chat_id, DEFAULT_MODEL)
+        facts = get_memory_for_chat(str(chat_id))
+        facts_str = "\n".join(f"- {f}" for f in facts) if facts else "Keine Fakten gespeichert."
+        msg = (
+            f"ℹ️ **Status-Informationen:**\n\n"
+            f"Aktives Modell: `{current_model}`\n\n"
+            f"**Gespeichertes Gedächtnis:**\n{facts_str}"
+        )
+        await client.post(f"{url}/sendMessage", json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"})
+        
+    else:
+        msg = "Unbekannter Befehl. Senden Sie `/start` für eine Liste der Befehle."
+        await client.post(f"{url}/sendMessage", json={"chat_id": chat_id, "text": msg})
+
 async def handle_telegram_message(client: httpx.AsyncClient, url: str, chat_id: int, text: str):
     if not is_user_allowed(chat_id):
         msg_text = (
@@ -178,16 +288,6 @@ async def handle_telegram_message(client: httpx.AsyncClient, url: str, chat_id: 
         await client.post(f"{url}/sendMessage", json={"chat_id": chat_id, "text": msg_text, "parse_mode": "Markdown"})
         return
 
-    if text.strip() == "/start":
-        welcome = (
-            "🤖 Willkommen beim VM-Server Chatbot!\n\n"
-            "Sie können mir beliebige Prompts senden. Ich nutze standardmäßig "
-            f"`{DEFAULT_MODEL}` und kann Python-Code ausführen, um Daten zu verarbeiten "
-            "oder Berechnungen anzustellen."
-        )
-        await client.post(f"{url}/sendMessage", json={"chat_id": chat_id, "text": welcome})
-        return
-
     # Send status message
     status_msg_response = await client.post(
         f"{url}/sendMessage", 
@@ -197,9 +297,10 @@ async def handle_telegram_message(client: httpx.AsyncClient, url: str, chat_id: 
     
     # Run the ReAct agent loop
     messages = [{"role": "user", "content": text}]
+    model = telegram_models.get(chat_id, DEFAULT_MODEL)
     try:
-        final_content, usage = await run_agent_loop(messages, DEFAULT_MODEL)
-        response_text = f"{final_content}\n\n---\n*Tokens:* {usage.get('total_tokens', 0)} ({DEFAULT_MODEL})"
+        final_content, usage = await run_agent_loop(messages, model, str(chat_id))
+        response_text = f"{final_content}\n\n---\n*Tokens:* {usage.get('total_tokens', 0)} ({model})"
         
         # Try to edit status message, or send a new one if editing fails
         edit_success = False
@@ -248,9 +349,14 @@ async def telegram_bot_loop():
                             message = update.get("message")
                             if message and "text" in message:
                                 chat_id = message["chat"]["id"]
-                                user_text = message["text"]
-                                # Process each message as a background task to prevent blocking the polling loop
-                                asyncio.create_task(handle_telegram_message(client, url, chat_id, user_text))
+                                user_text = message["text"].strip()
+                                
+                                if user_text.startswith("/"):
+                                    # Process command
+                                    asyncio.create_task(handle_telegram_command(client, url, chat_id, user_text))
+                                else:
+                                    # Process message
+                                    asyncio.create_task(handle_telegram_message(client, url, chat_id, user_text))
                 else:
                     print(f"Telegram-Bot: Fehler bei getUpdates: Status {response.status_code}")
                     await asyncio.sleep(5)
@@ -261,4 +367,16 @@ async def telegram_bot_loop():
 @app.on_event("startup")
 async def startup_event():
     load_dotenv()
+    
+    # Copy tools.py to AutoGen coding folder so executed python scripts can import it
+    src_tools = Path(__file__).parent / "tools.py"
+    dest_tools = Path("C:\\AI-Tools\\AutoGen\\coding\\tools.py")
+    if src_tools.exists():
+        try:
+            dest_tools.parent.mkdir(exist_ok=True, parents=True)
+            dest_tools.write_text(src_tools.read_text(encoding="utf-8"), encoding="utf-8")
+            print("tools.py erfolgreich nach AutoGen\\coding kopiert.")
+        except Exception as e:
+            print(f"Fehler beim Kopieren von tools.py: {e}")
+            
     asyncio.create_task(telegram_bot_loop())
