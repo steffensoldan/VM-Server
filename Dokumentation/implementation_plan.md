@@ -1,3 +1,42 @@
+# Implementation Plan: Schlanke Custom-Proxy-Architektur (GitHub-gestützter Workflow)
+
+Dieses Dokument beschreibt den Plan zur Umstellung des Proxy-Dienstes auf dem Windows-Server `sts-w-0001` auf eine vereinfachte Python-Lösung ohne AutoGen/LiteLLM. Wir nutzen das GitHub-Repository **`https://github.com/steffensoldan/VM-Server`** für die Versionierung und Bereitstellung.
+
+## User Review Required
+
+> [!IMPORTANT]
+> - **Infrastruktur-Vereinfachung:** LiteLLM und AutoGen werden deaktiviert. Der Proxy spricht direkt mit Ollama.
+> - **Git-Bereitstellung:** 
+>   1. Wir erstellen die Code-Dateien lokal auf Ihrem PC in `C:\Users\sts\.gemini\antigravity\playground\quantum-oort`.
+>   2. Wir initialisieren Git und verbinden den Ordner mit `https://github.com/steffensoldan/VM-Server.git`.
+>   3. Wir pushen den Code auf GitHub.
+>   4. Auf dem Server klonen wir das Repository nach `C:\AI-Tools\VM-Server`.
+>   5. Wir aktualisieren den Windows Scheduled Task `AutoGenProxy`, damit er das Skript aus dem neuen Git-Ordner ausführt.
+
+---
+
+## Proposed Changes
+
+### 1. Deaktivierung von LiteLLM
+Wir stoppen und deaktivieren den Dienst `LiteLLMService` auf dem Server.
+
+```powershell
+Stop-ScheduledTask -TaskName LiteLLMService
+Disable-ScheduledTask -TaskName LiteLLMService
+```
+
+### 2. Lokaler Git-Setup und Code-Erstellung (auf Ihrem PC)
+Wir erstellen die folgenden Dateien in Ihrem lokalen Arbeitsverzeichnis:
+
+#### [NEW] [proxy.py](file:///C:/Users/sts/.gemini/antigravity/playground/quantum-oort/proxy.py)
+Ein schlankes, robustes Python-Skript (ca. 120 Zeilen), das:
+- Direkt mit der Ollama-API auf `localhost:11434` spricht (Standard-Modell: `qwen2.5:3b`).
+- Python-Markdown-Codeblöcke (` ```python ... ``` `) im Antworttext sucht und per Subprozess ausführt.
+- Die Ausgabenergebnisse an das Modell zurückgibt, um eine interaktive Schleife (ReAct) zu ermöglichen.
+- Die Token-Nutzung dynamisch misst und an den Webchat zurückmeldet.
+- Windows UTF-8-Erzwingung vornimmt.
+
+```python
 import os
 os.environ["PYTHONUTF8"] = "1"
 os.environ["PYTHONUNBUFFERED"] = "1"
@@ -13,7 +52,6 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import ollama
-import httpx
 
 app = FastAPI()
 
@@ -26,22 +64,6 @@ app.add_middleware(
 
 ollama_client = ollama.AsyncClient(host="http://localhost:11434")
 DEFAULT_MODEL = "qwen2.5:3b"
-
-def load_dotenv():
-    env_path = Path(__file__).parent / ".env"
-    if env_path.exists():
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, val = line.split("=", 1)
-                os.environ[key.strip()] = val.strip()
-
-def is_user_allowed(chat_id: int) -> bool:
-    allowed_users_str = os.environ.get("TELEGRAM_ALLOWED_USERS", "")
-    if not allowed_users_str:
-        return False
-    allowed_ids = [int(x.strip()) for x in allowed_users_str.split(",") if x.strip().isdigit()]
-    return chat_id in allowed_ids
 
 def extract_code_block(text: str) -> str | None:
     match = re.search(r"```python\s*(.*?)\s*```", text, re.DOTALL)
@@ -72,10 +94,7 @@ async def run_agent_loop(messages: list, model: str):
         "You are a helpful assistant. If you need to write files, run calculations, "
         "or process data, write Python code inside a markdown code block starting with ```python and ending with ```. "
         "The system will execute your code automatically and return the console output to you. "
-        "IMPORTANT: You do NOT have internet access. Do not write Python code that attempts to "
-        "fetch web pages, scrape websites, or call external web APIs. All operations must be "
-        "performed completely locally using standard libraries or pre-installed packages. "
-        "Always specify encoding='utf-8' when reading or writing files in Python to prevent errors. "
+        "IMPORTANT: Always specify encoding='utf-8' when reading or writing files in Python to prevent errors. "
         "Specify the full code, and make sure it prints the outputs you want to see."
     )
     
@@ -165,100 +184,53 @@ async def get_models():
             {"id": "llama3.2:3b", "object": "model", "created": int(time.time()), "owned_by": "ollama"}
         ]
     }
+```
 
-async def handle_telegram_message(client: httpx.AsyncClient, url: str, chat_id: int, text: str):
-    if not is_user_allowed(chat_id):
-        msg_text = (
-            f"❌ Zugriff verweigert.\n\n"
-            f"Ihre Chat-ID ist: `{chat_id}`\n\n"
-            f"Bitte fügen Sie diese ID in der `.env`-Datei auf dem Server hinzu:\n"
-            f"`TELEGRAM_ALLOWED_USERS={chat_id}`\n\n"
-            f"Starten Sie danach den Dienst neu."
-        )
-        await client.post(f"{url}/sendMessage", json={"chat_id": chat_id, "text": msg_text, "parse_mode": "Markdown"})
-        return
+#### [NEW] [requirements.txt](file:///C:/Users/sts/.gemini/antigravity/playground/quantum-oort/requirements.txt)
+Definiert die minimalen Abhängigkeiten für die virtuelle Umgebung des Servers:
+```text
+fastapi
+uvicorn
+ollama
+```
 
-    if text.strip() == "/start":
-        welcome = (
-            "🤖 Willkommen beim VM-Server Chatbot!\n\n"
-            "Sie können mir beliebige Prompts senden. Ich nutze standardmäßig "
-            f"`{DEFAULT_MODEL}` und kann Python-Code ausführen, um Daten zu verarbeiten "
-            "oder Berechnungen anzustellen."
-        )
-        await client.post(f"{url}/sendMessage", json={"chat_id": chat_id, "text": welcome})
-        return
+### 3. Git Push auf GitHub (Lokal)
+Wir initialisieren das lokale Repository und pushen auf Ihr GitHub:
+```powershell
+git init
+git remote add origin https://github.com/steffensoldan/VM-Server.git
+git branch -M main
+git add proxy.py requirements.txt
+git commit -m "Initial commit: Custom Proxy"
+git push -u origin main
+```
 
-    # Send status message
-    status_msg_response = await client.post(
-        f"{url}/sendMessage", 
-        json={"chat_id": chat_id, "text": "Currently flying..."}
-    )
-    status_msg_id = status_msg_response.json().get("result", {}).get("message_id") if status_msg_response.status_code == 200 else None
-    
-    # Run the ReAct agent loop
-    messages = [{"role": "user", "content": text}]
-    try:
-        final_content, usage = await run_agent_loop(messages, DEFAULT_MODEL)
-        response_text = f"{final_content}\n\n---\n*Tokens:* {usage.get('total_tokens', 0)} ({DEFAULT_MODEL})"
-        
-        # Try to edit status message, or send a new one if editing fails
-        edit_success = False
-        if status_msg_id:
-            edit_res = await client.post(
-                f"{url}/editMessageText",
-                json={"chat_id": chat_id, "message_id": status_msg_id, "text": response_text, "parse_mode": "Markdown"}
-            )
-            if edit_res.status_code == 200:
-                edit_success = True
-                
-        if not edit_success:
-            await client.post(
-                f"{url}/sendMessage", 
-                json={"chat_id": chat_id, "text": response_text, "parse_mode": "Markdown"}
-            )
-    except Exception as e:
-        error_text = f"Fehler bei der Verarbeitung: {str(e)}"
-        await client.post(f"{url}/sendMessage", json={"chat_id": chat_id, "text": error_text})
+### 4. Deployment auf dem Server `sts-w-0001` (über SSH)
+Wir klonen das GitHub-Repository auf dem Server und installieren die Abhängigkeiten im bestehenden venv:
+1. **GitHub Repository klonen:**
+   ```powershell
+   git clone https://github.com/steffensoldan/VM-Server.git C:\AI-Tools\VM-Server
+   ```
+2. **Abhängigkeiten im venv installieren:**
+   ```powershell
+   C:\AI-Tools\AutoGen\venv\Scripts\pip.exe install -r C:\AI-Tools\VM-Server\requirements.txt
+   ```
+3. **Scheduled Task aktualisieren:**
+   Wir ändern die geplante Aufgabe `AutoGenProxy`, sodass sie das neue Skript `C:\AI-Tools\VM-Server\proxy.py` ausführt.
+   - Neuer Befehl: `C:\AI-Tools\AutoGen\venv\Scripts\python.exe -m uvicorn proxy:app --host 0.0.0.0 --port 4000`
+   - Startpfad (Working Directory): `C:\AI-Tools\VM-Server`
+4. **Task neu starten:**
+   ```powershell
+   Stop-ScheduledTask -TaskName AutoGenProxy
+   Start-ScheduledTask -TaskName AutoGenProxy
+   ```
 
-async def telegram_bot_loop():
-    # Wait for the main app startup
-    await asyncio.sleep(2)
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        print("Telegram-Bot: Kein Token in TELEGRAM_BOT_TOKEN gefunden. Bot wird übersprungen.")
-        return
+---
 
-    print("Telegram-Bot: Bot-Schleife gestartet.")
-    offset = 0
-    
-    # We use a long timeout client for polling
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        url = f"https://api.telegram.org/bot{token}"
-        while True:
-            try:
-                response = await client.get(
-                    f"{url}/getUpdates", 
-                    params={"offset": offset, "timeout": 20}
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get("ok"):
-                        for update in data.get("result", []):
-                            offset = update["update_id"] + 1
-                            message = update.get("message")
-                            if message and "text" in message:
-                                chat_id = message["chat"]["id"]
-                                user_text = message["text"]
-                                # Process each message as a background task to prevent blocking the polling loop
-                                asyncio.create_task(handle_telegram_message(client, url, chat_id, user_text))
-                else:
-                    print(f"Telegram-Bot: Fehler bei getUpdates: Status {response.status_code}")
-                    await asyncio.sleep(5)
-            except Exception as e:
-                print(f"Telegram-Bot: Verbindungsfehler: {e}")
-                await asyncio.sleep(5)
+## Verification Plan
 
-@app.on_event("startup")
-async def startup_event():
-    load_dotenv()
-    asyncio.create_task(telegram_bot_loop())
+### Automated Tests
+1. **Inferenz- und Codeausführungstest:** Aufruf des HTTP-Endpoints des Servers und Verifizierung, dass Qwen 2.5 3B Python-Code ausführt und Ergebnisse korrekt in UTF-8 zurückliefert.
+
+### Manual Verification
+- Test über den Webchat, um sicherzustellen, dass die Umlaut-Problematik und die Token-Zählung einwandfrei funktionieren.
