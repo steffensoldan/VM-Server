@@ -149,18 +149,18 @@ Das Modell ist im System-Prompt angewiesen, für jeglichen Excel- oder CSV-Datei
 
 ## 8. Monitoring & Watchdog-Dienst (Selbstheilung)
 
-Um die HochverfÃ¼gbarkeit der Dienste zu garantieren und das standardmÃ¤ÃŸige 72-Stunden-Limit von Windows-Tasks zu umgehen, wurden folgende Mechanismen implementiert:
+Um die Hochverfügbarkeit der Dienste zu garantieren und das standardmäßige 72-Stunden-Limit von Windows-Tasks zu umgehen, wurden folgende Mechanismen implementiert:
 
 ### Unbegrenzte Laufzeit der Hauptdienste
-Das voreingestellte Limit von 3 Tagen (`ExecutionTimeLimit: PT72H`) fÃ¼r die Aufgaben `OllamaService` und `AutoGenProxy` wurde dauerhaft aufgehoben (`ExecutionTimeLimit: PT0S`). Die Tasks laufen nun unbegrenzt.
+Das voreingestellte Limit von 3 Tagen (`ExecutionTimeLimit: PT72H`) für die Aufgaben `OllamaService` und `AutoGenProxy` wurde dauerhaft aufgehoben (`ExecutionTimeLimit: PT0S`). Die Tasks laufen nun unbegrenzt.
 
 ### Watchdog-Task (`AutoGenProxyWatchdog`)
 Eine neue geplante Windows-Aufgabe `AutoGenProxyWatchdog` wurde auf dem Server registriert:
-- **Dateipfad:** [watchdog.ps1](file:///C:/AI-Tools/VM-Server/watchdog.ps1) (lokal: [watchdog.ps1](file:///c:/Users/sts/.gemini/antigravity/playground/quantum-oort/watchdog.ps1))
-- **Intervall:** LÃ¤uft alle 15 Minuten (und zusÃ¤tzlich beim Systemstart).
-- **Benutzerkonto:** LÃ¤uft unter dem Benutzer `AI-Admin`.
+- **Dateipfad:** [watchdog.ps1](file:///C:/AI-Tools/VM-Server/watchdog.ps1) (lokal: [watchdog.ps1](file:///C:/Users/sts/Projekte-Antigravity/quantum-oort/watchdog.ps1))
+- **Intervall:** Läuft alle 15 Minuten (und zusätzlich beim Systemstart).
+- **Benutzerkonto:** Läuft unter dem Benutzer `AI-Admin`.
 - **Aktionen:**
-  1. PrÃ¼ft, ob `OllamaService` lÃ¤uft; falls nicht, wird dieser gestartet.
-  2. PrÃ¼ft, ob `AutoGenProxy` lÃ¤uft; falls nicht, wird dieser gestartet.
-  3. PrÃ¼ft, ob Port `4000` aktiv ist; falls die Aufgabe zwar lÃ¤uft, der Port aber nicht antwortet, wird der Proxy neu gestartet.
+  1. Prüft, ob `OllamaService` läuft; falls nicht, wird dieser gestartet.
+  2. Prüft, ob `AutoGenProxy` läuft; falls nicht, wird dieser gestartet.
+  3. Prüft, ob Port `4000` aktiv ist; falls die Aufgabe zwar läuft, der Port aber nicht antwortet, wird der Proxy neu gestartet.
   4. Liest die Telegram-Zugangsdaten aus der Datei `C:\AI-Tools\VM-Server\.env` und sendet bei automatischen Restarts eine Warnung per Telegram an die erste hinterlegte Chat-ID.
