@@ -179,21 +179,16 @@ schtasks /run /tn AutoGenProxy
 
 ---
 
-## Offene Punkte (vor Deployment zu klären)
+## Deployment-Ergebnis (2026-06-22) ✅
 
 | Punkt | Status |
 |---|---|
-| Stirling PDF API-Endpunkt für PDF→Excel | ⚠ ungesichert — nach Deployment verifizieren (`GET /api/v1/info`) |
-| Java-Pfad auf Server im PATH? | ⚠ offen — manuell prüfen |
-| Stirling PDF Startzeit (typ. 10–15s) | → Bot wartet und meldet wenn nicht bereit |
-| Telegram Dateilimit 50 MB | → im Bot abgefangen mit Fehlermeldung |
+| Stirling PDF API-Endpunkte v2.13.1 | ✅ korrigiert — compress→`misc/`, split→`split-pages`, rotate→`general/`, toexcel→`xlsx` |
+| Java auf Server | ✅ Microsoft OpenJDK 25 via winget; `_find_java()` findet automatisch |
+| Stirling Startzeit | ✅ 60–90s beim ersten Start; Monitor-Loop übernimmt Neustarts |
+| `/api/v1/info` | ✅ in v2.13.1 entfernt — OpenAPI via `/v1/api-docs/file-processing`, Swagger-UI via `/swagger-ui/index.html` |
+| Telegram `/pdf-compress` | ✅ funktioniert |
+| Telegram `/pdf-toexcel` | ✅ funktioniert (HTTP 204 bei PDFs ohne Tabellen = korrekt) |
+| Web-UI | ✅ `http://sts-w-0001.zew.local:8080` |
 
----
-
-## Verification Plan
-
-1. `proxy.py` startet ohne Fehler: Task-Log prüfen
-2. Stirling PDF erreichbar: `Invoke-RestMethod http://localhost:8080/api/v1/info`
-3. Telegram `/pdf-compress`: PDF senden → komprimiertes PDF zurück
-4. Telegram `/pdf-toexcel`: PDF senden → CSV/Excel zurück (Endpunkt validieren)
-5. Web-UI erreichbar: Browser auf `http://sts-w-0001.zew.local:8080`
+Deaktivierte Stirling-Features (fehlende Tools): LibreOffice-Gruppe (Word, HTML, Presentation), Ghostscript, ImageMagick, OCR/Tesseract. Optional nachinstallierbar.

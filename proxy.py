@@ -10,6 +10,7 @@ import re
 import subprocess
 import importlib
 import inspect
+import shutil
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -108,22 +109,58 @@ def stirling_verfuegbar() -> bool:
     except OSError:
         return False
 
+def _find_java() -> str:
+    """Findet java.exe im PATH oder bekannten Installationspfaden."""
+    j = shutil.which("java")
+    if j:
+        return j
+    kandidaten = [
+        Path(r"C:\Program Files\Microsoft"),
+        Path(r"C:\Program Files\Eclipse Adoptium"),
+        Path(r"C:\Program Files\Java"),
+        Path(r"C:\Program Files\OpenJDK"),
+    ]
+    for base in kandidaten:
+        if base.exists():
+            for p in base.rglob("java.exe"):
+                if "bin" in p.parts:
+                    return str(p)
+    raise FileNotFoundError("java.exe nicht gefunden — Java 17+ installieren und PATH prüfen.")
+
+STIRLING_LOG = Path("C:/AI-Tools/VM-Server/stirling.log")
+
+def _stirling_log(msg: str):
+    """Schreibt Stirling-Status in Datei und stdout."""
+    line = f"[{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line)
+    try:
+        with STIRLING_LOG.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
 async def stirling_starten():
     """Startet Stirling PDF als Hintergrund-Subprocess. Kein Fehler wenn JAR fehlt."""
     global _stirling_proc
     if not STIRLING_JAR.exists():
-        print(f"Stirling PDF: JAR nicht gefunden unter {STIRLING_JAR}. PDF-Funktionen deaktiviert.")
+        _stirling_log(f"JAR nicht gefunden unter {STIRLING_JAR}. PDF-Funktionen deaktiviert.")
         return
     if stirling_verfuegbar():
-        print("Stirling PDF: läuft bereits auf Port 8080.")
+        _stirling_log("Läuft bereits auf Port 8080.")
         return
-    _stirling_proc = subprocess.Popen(
-        ["java", "-jar", str(STIRLING_JAR), f"--server.port=8080"],
-        cwd=str(STIRLING_JAR.parent.parent),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    print(f"Stirling PDF: Subprocess gestartet (PID {_stirling_proc.pid}).")
+    try:
+        java_exe = _find_java()
+        _stirling_log(f"Starte mit {java_exe} ...")
+        stderr_log = open(str(STIRLING_LOG.parent / "stirling_stderr.log"), "w", encoding="utf-8")
+        _stirling_proc = subprocess.Popen(
+            [java_exe, "-jar", str(STIRLING_JAR), "--server.port=8080"],
+            cwd=str(STIRLING_JAR.parent.parent),
+            stdout=stderr_log,
+            stderr=stderr_log,
+        )
+        _stirling_log(f"Subprocess gestartet (PID {_stirling_proc.pid}).")
+    except Exception as e:
+        _stirling_log(f"FEHLER beim Starten — {e}")
 
 async def stirling_monitor_loop():
     """Überwacht Stirling-Subprocess alle 60s und startet neu bei Absturz."""
@@ -156,13 +193,20 @@ async def stirling_api(
         return None
     try:
         multipart = [("fileInput", (name, daten, "application/pdf")) for name, daten in dateien]
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            res = await client.post(
+        async with httpx.AsyncClient(timeout=120.0) as c:
+            res = await c.post(
                 f"{STIRLING_URL}{endpunkt}",
                 files=multipart,
                 data=felder or {},
             )
-        return res.content if res.status_code == 200 else None
+        if res.status_code == 200:
+            return res.content
+        if res.status_code == 204:
+            return b"__204__"   # Kein Inhalt (z.B. keine Tabellen in PDF)
+        msg = f"HTTP {res.status_code} für {endpunkt}: {res.text[:300]}"
+        print(f"Stirling API Fehler: {msg}")
+        _stirling_log(f"API-Fehler — {msg}")
+        return None
     except Exception as e:
         print(f"Stirling API Fehler ({endpunkt}): {e}")
         return None
@@ -181,12 +225,12 @@ PDF_BEFEHLE = {
 }
 
 PDF_ENDPUNKTE = {
-    "compress": "/api/v1/general/compress-pdf",
-    "merge":    "/api/v1/general/merge-pdfs",
-    "split":    "/api/v1/general/split-pdf",
-    "rotate":   "/api/v1/misc/rotate-pdf",
-    "topng":    "/api/v1/convert/pdf/img",
-    "toexcel":  "/api/v1/convert/pdf/csv",   # ⚠ nach Deployment verifizieren
+    "compress": "/api/v1/misc/compress-pdf",       # Misc-Kategorie
+    "merge":    "/api/v1/general/merge-pdfs",      # korrekt
+    "split":    "/api/v1/general/split-pages",     # war split-pdf
+    "rotate":   "/api/v1/general/rotate-pdf",      # war misc/rotate-pdf
+    "topng":    "/api/v1/convert/pdf/img",         # korrekt
+    "toexcel":  "/api/v1/convert/pdf/xlsx",        # war csv — xlsx ist PDF→Excel
 }
 
 async def handle_pdf_befehl(
@@ -307,8 +351,16 @@ async def pdf_verarbeiten(client: httpx.AsyncClient, tg_url: str, chat_id: int):
 
     ergebnis = await stirling_api(PDF_ENDPUNKTE[op], dateien, felder)
 
+    if ergebnis == b"__204__":
+        text = "ℹ️ Keine Ergebnisse — die PDF enthält keine extrahierbaren Tabellen (für /pdf-toexcel wird eine PDF mit Tabellenstruktur benötigt)."
+        if status_id:
+            await client.post(f"{tg_url}/editMessageText",
+                json={"chat_id": chat_id, "message_id": status_id, "text": text})
+        else:
+            await client.post(f"{tg_url}/sendMessage", json={"chat_id": chat_id, "text": text})
+        return
     if ergebnis is None:
-        text = "❌ Stirling PDF nicht erreichbar oder Fehler. JAR deployt und Java installiert?"
+        text = "❌ Stirling PDF: Fehler bei der Verarbeitung."
         if status_id:
             await client.post(f"{tg_url}/editMessageText",
                 json={"chat_id": chat_id, "message_id": status_id, "text": text})

@@ -147,7 +147,44 @@ Das Modell ist im System-Prompt angewiesen, für jeglichen Excel- oder CSV-Datei
 
 ---
 
-## 8. Monitoring & Watchdog-Dienst (Selbstheilung)
+## 8. Stirling PDF Integration (Sprint 2026-06-22)
+
+Stirling PDF läuft als Subprocess von `proxy.py` auf Port 8080. PDF-Befehle sind direkt im Telegram-Bot verfügbar.
+
+### Deployment-Details
+
+| Komponente | Wert |
+|---|---|
+| JAR | `C:\AI-Tools\Stirling-PDF\app\stirling-pdf.jar` (v2.13.1, 223 MB) |
+| Java | Microsoft OpenJDK 25 (`C:\Program Files\Microsoft\jdk-25.0.3.9-hotspot`) |
+| Port | 8080 (Subprocess von AutoGenProxy) |
+| Web-UI | `http://sts-w-0001.zew.local:8080` |
+
+### Verfügbare Telegram-Befehle
+
+| Befehl | API-Endpunkt | Funktion |
+|---|---|---|
+| `/pdf-compress` | `POST /api/v1/misc/compress-pdf` | PDF komprimieren |
+| `/pdf-merge` | `POST /api/v1/general/merge-pdfs` | PDFs zusammenführen |
+| `/pdf-split [Seiten]` | `POST /api/v1/general/split-pages` | PDF aufteilen |
+| `/pdf-rotate [Grad]` | `POST /api/v1/general/rotate-pdf` | PDF drehen (Standard: 90°) |
+| `/pdf-topng` | `POST /api/v1/convert/pdf/img` | PDF → PNG-Bilder |
+| `/pdf-toexcel` | `POST /api/v1/convert/pdf/xlsx` | PDF-Tabellen → XLSX (nur tabellarische PDFs) |
+
+### Wichtige Implementierungsdetails
+
+- `_find_java()` sucht Java automatisch in PATH und bekannten Installationspfaden — kein Hardcoding
+- Stirling-Subprocess wird beim proxy.py-Start gestartet, Monitor-Loop prüft alle 60s
+- Logging in `stirling.log` und `stirling_stderr.log` (beide in `C:\AI-Tools\VM-Server\`)
+- Für PDF→Word/HTML/Presentation ist LibreOffice (`soffice`) erforderlich — aktuell nicht installiert
+- API-Endpunkte in v2.13.1 gegenüber früherer Planung geändert (compress: misc/, split: split-pages, rotate: general/, toexcel: xlsx statt csv)
+
+### Workaround für `/api/v1/info`
+In v2.13.1 nicht mehr verfügbar. Stattdessen: `GET /v1/api-docs/file-processing` für OpenAPI-Spec oder Swagger-UI unter `http://sts-w-0001.zew.local:8080/swagger-ui/index.html`.
+
+---
+
+## 9. Monitoring & Watchdog-Dienst (Selbstheilung)
 
 Um die Hochverfügbarkeit der Dienste zu garantieren und das standardmäßige 72-Stunden-Limit von Windows-Tasks zu umgehen, wurden folgende Mechanismen implementiert:
 
