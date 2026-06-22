@@ -52,7 +52,7 @@ if ($ollamaTask) {
     Send-TelegramAlert "Aufgabe 'OllamaService' wurde auf dem Server nicht gefunden!"
 }
 
-# 2. Check & Restart AutoGenProxy if down
+# 2. Check & Restart AutoGenProxy if down (beinhaltet Stirling PDF Subprocess)
 $proxyTask = Get-ScheduledTask -TaskName "AutoGenProxy" -ErrorAction SilentlyContinue
 if ($proxyTask) {
     if ($proxyTask.State -ne "Running") {
@@ -72,4 +72,22 @@ if ($proxyTask) {
     }
 } else {
     Send-TelegramAlert "Aufgabe 'AutoGenProxy' wurde auf dem Server nicht gefunden!"
+}
+
+# 3. Stirling PDF (Port 8080) — läuft als Subprocess von AutoGenProxy
+# Wenn Port 8080 fehlt, reicht AutoGenProxy-Neustart (der startet den Subprocess neu).
+$stirlingJar = "C:\AI-Tools\Stirling-PDF\app\stirling-pdf.jar"
+if (Test-Path $stirlingJar) {
+    $port8080 = Get-NetTCPConnection -LocalPort 8080 -ErrorAction SilentlyContinue
+    if (-not $port8080) {
+        Write-Host "Stirling PDF (Port 8080) nicht aktiv. AutoGenProxy wird neu gestartet..."
+        Stop-ScheduledTask -TaskName "AutoGenProxy" -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+        Start-ScheduledTask -TaskName "AutoGenProxy"
+        Send-TelegramAlert "Stirling PDF (Port 8080) nicht erreichbar. AutoGenProxy neu gestartet."
+    } else {
+        Write-Host "Stirling PDF OK (Port 8080 aktiv)."
+    }
+} else {
+    Write-Host "Stirling PDF JAR nicht vorhanden — Überwachung übersprungen."
 }

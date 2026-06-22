@@ -1,236 +1,199 @@
-# Implementation Plan: Schlanke Custom-Proxy-Architektur (GitHub-gestützter Workflow)
+# Implementation Plan: VM-Server + Stirling PDF Integration
 
-Dieses Dokument beschreibt den Plan zur Umstellung des Proxy-Dienstes auf dem Windows-Server `sts-w-0001` auf eine vereinfachte Python-Lösung ohne AutoGen/LiteLLM. Wir nutzen das GitHub-Repository **`https://github.com/steffensoldan/VM-Server`** für die Versionierung und Bereitstellung.
+Dieses Dokument beschreibt die Erweiterung des bestehenden `proxy.py` um lokale PDF-Verarbeitung via Stirling PDF. Die Grundarchitektur (FastAPI + Telegram-Bot-Loop im selben Prozess) bleibt unverändert.
 
 ## User Review Required
 
 > [!IMPORTANT]
-> - **Infrastruktur-Vereinfachung:** LiteLLM und AutoGen werden deaktiviert. Der Proxy spricht direkt mit Ollama.
-> - **Git-Bereitstellung:** 
->   1. Wir erstellen die Code-Dateien lokal auf Ihrem PC in `C:\Users\sts\.gemini\antigravity\playground\quantum-oort`.
->   2. Wir initialisieren Git und verbinden den Ordner mit `https://github.com/steffensoldan/VM-Server.git`.
->   3. Wir pushen den Code auf GitHub.
->   4. Auf dem Server klonen wir das Repository nach `C:\AI-Tools\VM-Server`.
->   5. Wir aktualisieren den Windows Scheduled Task `AutoGenProxy`, damit er das Skript aus dem neuen Git-Ordner ausführt.
+> - **Keine neuen Scheduled Tasks**: Stirling PDF läuft als Subprocess von `proxy.py`. Nur `AutoGenProxy` bleibt der einzige Task.
+> - **JAR nicht im Git-Repo**: `C:\AI-Tools\Stirling-PDF\app\stirling-pdf.jar` wird manuell deployt (ZIP entpacken). Liegt im `.gitignore`.
+> - **Telegram ≠ DSGVO-sicher**: PDF-Befehle über Telegram nur für nicht-personenbezogene Dokumente. Für DSGVO-sensitive Dokumente: Web-UI unter `http://sts-w-0001.zew.local:8080`.
+> - **Java 17+ Voraussetzung**: Muss auf Server vorhanden sein.
+
+---
+
+## Architektur
+
+```
+AutoGenProxy (Scheduled Task, AI-Admin)
+  └── proxy.py
+        ├── FastAPI (Port 4000) — bestehend, unverändert
+        ├── Telegram-Bot-Loop — erweitert um PDF-Befehle
+        │     ├── /pdf-compress   → Stirling API POST /compress-pdf
+        │     ├── /pdf-merge      → Stirling API POST /merge-pdfs
+        │     ├── /pdf-split      → Stirling API POST /split-pdf
+        │     ├── /pdf-rotate     → Stirling API POST /rotate-pdf
+        │     ├── /pdf-toexcel    → Stirling API POST /pdf-csv (⚠ Endpunkt verifizieren)
+        │     └── /pdf-topng      → Stirling API POST /pdf-img
+        └── Stirling PDF Subprocess (Port 8080)
+              └── java -jar C:\AI-Tools\Stirling-PDF\app\stirling-pdf.jar
+
+Web-UI (intern, kein Telegram):
+  Browser → http://sts-w-0001.zew.local:8080  (Stirling PDF built-in UI)
+```
+
+---
+
+## Geänderte Dateien
+
+| Datei | Art | Beschreibung |
+|---|---|---|
+| `proxy.py` | Erweiterung | Stirling-Subprocess + PDF-Telegram-Befehle |
+| `watchdog.ps1` | Erweiterung | Port 8080 überwachen, Subprocess-Neustart |
+| `requirements.txt` | unverändert | httpx bereits vorhanden |
+| `Dokumentation/task.md` | Erweiterung | neue Aufgaben |
+
+**Nicht geändert:** Bestehende LLM-Logik, `/model`, `/remember`, `/forget`, `/info`, `/tools`, ReAct-Loop.
 
 ---
 
 ## Proposed Changes
 
-### 1. Deaktivierung von LiteLLM
-Wir stoppen und deaktivieren den Dienst `LiteLLMService` auf dem Server.
+### 1. `proxy.py` — Neue Sektionen (anhängen, nichts überschreiben)
 
-```powershell
-Stop-ScheduledTask -TaskName LiteLLMService
-Disable-ScheduledTask -TaskName LiteLLMService
-```
-
-### 2. Lokaler Git-Setup und Code-Erstellung (auf Ihrem PC)
-Wir erstellen die folgenden Dateien in Ihrem lokalen Arbeitsverzeichnis:
-
-#### [NEW] [proxy.py](file:///C:/Users/sts/.gemini/antigravity/playground/quantum-oort/proxy.py)
-Ein schlankes, robustes Python-Skript (ca. 120 Zeilen), das:
-- Direkt mit der Ollama-API auf `localhost:11434` spricht (Standard-Modell: `qwen2.5:3b`).
-- Python-Markdown-Codeblöcke (` ```python ... ``` `) im Antworttext sucht und per Subprozess ausführt.
-- Die Ausgabenergebnisse an das Modell zurückgibt, um eine interaktive Schleife (ReAct) zu ermöglichen.
-- Die Token-Nutzung dynamisch misst und an den Webchat zurückmeldet.
-- Windows UTF-8-Erzwingung vornimmt.
+#### 1a. Konstanten (oben im Modul, nach den Imports)
 
 ```python
-import os
-os.environ["PYTHONUTF8"] = "1"
-os.environ["PYTHONUNBUFFERED"] = "1"
-
-import asyncio
-import json
-import time
-import sys
-import re
-import subprocess
-from pathlib import Path
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-import ollama
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-ollama_client = ollama.AsyncClient(host="http://localhost:11434")
-DEFAULT_MODEL = "qwen2.5:3b"
-
-def extract_code_block(text: str) -> str | None:
-    match = re.search(r"```python\s*(.*?)\s*```", text, re.DOTALL)
-    return match.group(1).strip() if match else None
-
-def run_python_code(code: str) -> str:
-    work_dir = Path("C:\\AI-Tools\\AutoGen\\coding")
-    work_dir.mkdir(exist_ok=True)
-    file_path = work_dir / f"tmp_code_{int(time.time())}.py"
-    try:
-        file_path.write_text(code, encoding="utf-8")
-        res = subprocess.run(
-            [sys.executable, str(file_path)],
-            capture_output=True, text=True, encoding="utf-8",
-            cwd=str(work_dir), timeout=30
-        )
-        output = res.stdout
-        if res.stderr:
-            output += "\n" + res.stderr
-        return output if output.strip() else "[Code wurde erfolgreich ohne Konsolenausgabe ausgeführt]"
-    except subprocess.TimeoutExpired:
-        return "Fehler: Zeitlimit von 30 Sekunden überschritten."
-    except Exception as e:
-        return f"Fehler bei der Ausführung: {str(e)}"
-
-async def run_agent_loop(messages: list, model: str):
-    system_msg = (
-        "You are a helpful assistant. If you need to write files, run calculations, "
-        "or process data, write Python code inside a markdown code block starting with ```python and ending with ```. "
-        "The system will execute your code automatically and return the console output to you. "
-        "IMPORTANT: Always specify encoding='utf-8' when reading or writing files in Python to prevent errors. "
-        "Specify the full code, and make sure it prints the outputs you want to see."
-    )
-    
-    ollama_messages = [{"role": "system", "content": system_msg}]
-    for msg in messages:
-        role = msg.get("role")
-        content = msg.get("content")
-        if role in ["user", "assistant"]:
-            ollama_messages.append({"role": role, "content": content})
-            
-    prompt_tokens = 0
-    completion_tokens = 0
-    
-    for _ in range(3):
-        response = await ollama_client.chat(model=model, messages=ollama_messages)
-        prompt_tokens += response.get("prompt_eval_count", 0)
-        completion_tokens += response.get("eval_count", 0)
-        
-        content = response["message"]["content"]
-        code_block = extract_code_block(content)
-        
-        if not code_block:
-            return content, {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens}
-            
-        result = run_python_code(code_block)
-        ollama_messages.append({"role": "assistant", "content": content})
-        ollama_messages.append({"role": "user", "content": f"[System: Code-Ausgabe]:\n{result}"})
-        
-    return content, {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens}
-
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
-    body = await request.json()
-    model = body.get("model", DEFAULT_MODEL)
-    openai_messages = body.get("messages", [])
-    stream = body.get("stream", False)
-    
-    if not stream:
-        final_content, usage = await run_agent_loop(openai_messages, model)
-        return {
-            "id": f"chatcmpl-{int(time.time())}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": final_content}, "finish_reason": "stop"}],
-            "usage": usage
-        }
-    else:
-        async def event_generator():
-            response_id = f"chatcmpl-{int(time.time())}"
-            initial_chunk = {
-                "id": response_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
-                "choices": [{"index": 0, "delta": {"content": "Currently flying....\n\n"}, "finish_reason": None}]
-            }
-            yield f"data: {json.dumps(initial_chunk)}\n\n"
-            await asyncio.sleep(0.05)
-            
-            final_content, usage = await run_agent_loop(openai_messages, model)
-            
-            words = final_content.split(" ")
-            for i, word in enumerate(words):
-                space = " " if i > 0 else ""
-                chunk = {
-                    "id": response_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
-                    "choices": [{"index": 0, "delta": {"content": f"{space}{word}"}, "finish_reason": None}]
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
-                await asyncio.sleep(max(0.01, min(0.05, len(word) * 0.008)))
-                
-            done_chunk = {
-                "id": response_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                "usage": usage
-            }
-            yield f"data: {json.dumps(done_chunk)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(event_generator(), media_type="text/event-stream; charset=utf-8")
-
-@app.get("/v1/models")
-async def get_models():
-    return {
-        "object": "list",
-        "data": [
-            {"id": "qwen2.5:3b", "object": "model", "created": int(time.time()), "owned_by": "ollama"},
-            {"id": "gemma2:9b", "object": "model", "created": int(time.time()), "owned_by": "ollama"},
-            {"id": "llama3.2:3b", "object": "model", "created": int(time.time()), "owned_by": "ollama"}
-        ]
-    }
+STIRLING_URL   = "http://localhost:8080"
+STIRLING_JAR   = Path("C:/AI-Tools/Stirling-PDF/app/stirling-pdf.jar")
+STIRLING_PORT  = 8080
 ```
 
-#### [NEW] [requirements.txt](file:///C:/Users/sts/.gemini/antigravity/playground/quantum-oort/requirements.txt)
-Definiert die minimalen Abhängigkeiten für die virtuelle Umgebung des Servers:
-```text
-fastapi
-uvicorn
-ollama
+#### 1b. Subprocess-Management (neue Funktionen)
+
+```python
+stirling_proc: subprocess.Popen | None = None
+
+def stirling_verfuegbar() -> bool:
+    """Prüft ob Stirling PDF auf Port 8080 antwortet."""
+
+async def stirling_starten():
+    """Startet Stirling PDF als Subprocess. Kein Fehler wenn JAR fehlt."""
+
+async def stirling_monitor_loop():
+    """Prüft alle 60s ob Stirling läuft; startet neu bei Absturz."""
 ```
 
-### 3. Git Push auf GitHub (Lokal)
-Wir initialisieren das lokale Repository und pushen auf Ihr GitHub:
+#### 1c. PDF-API-Wrapper (neue Funktion)
+
+```python
+async def stirling_api(
+    client: httpx.AsyncClient,
+    endpunkt: str,
+    dateien: list[tuple[str, bytes]],
+    felder: dict | None = None
+) -> bytes | None:
+    """Schlanker Wrapper für alle Stirling-Endpunkte. Gibt Ergebnis-Bytes zurück."""
+```
+
+#### 1d. Telegram PDF-Handler (neue Funktionen)
+
+```python
+# Zustandsspeicher für mehrstufige Operationen (z.B. Merge)
+pdf_zustand: dict[int, dict] = {}
+
+async def handle_pdf_befehl(client, tg_url, chat_id, befehl, arg):
+    """Verarbeitet /pdf-* Befehle. Setzt Zustand für Datei-Empfang."""
+
+async def handle_pdf_datei(client, tg_url, chat_id, message, config):
+    """Empfängt PDF, ruft Stirling API auf, sendet Ergebnis zurück."""
+```
+
+#### 1e. Einbindung in bestehende Handler
+
+- `handle_telegram_command()`: `/pdf-*` Befehle an `handle_pdf_befehl()` delegieren
+- `handle_telegram_message()`: Dokument-Nachrichten an `handle_pdf_datei()` prüfen
+- `startup_event()`: `stirling_starten()` und `stirling_monitor_loop()` als Task
+
+---
+
+### 2. `watchdog.ps1` — Port 8080 ergänzen
+
+Analog zu bestehendem Port-4000-Check:
 ```powershell
-git init
-git remote add origin https://github.com/steffensoldan/VM-Server.git
-git branch -M main
-git add proxy.py requirements.txt
-git commit -m "Initial commit: Custom Proxy"
-git push -u origin main
+# Stirling PDF (Port 8080) — läuft als Subprocess von AutoGenProxy
+$port8080 = Get-NetTCPConnection -LocalPort 8080 -ErrorAction SilentlyContinue
+if (-not $port8080) {
+    # AutoGenProxy neu starten triggert Stirling-Subprocess-Neustart
+    Stop-ScheduledTask -TaskName AutoGenProxy
+    Start-Sleep -Seconds 2
+    Start-ScheduledTask -TaskName AutoGenProxy
+    Send-TelegramAlert "Stirling PDF (Port 8080) nicht aktiv. AutoGenProxy neu gestartet."
+}
 ```
 
-### 4. Deployment auf dem Server `sts-w-0001` (über SSH)
-Wir klonen das GitHub-Repository auf dem Server und installieren die Abhängigkeiten im bestehenden venv:
-1. **GitHub Repository klonen:**
-   ```powershell
-   git clone https://github.com/steffensoldan/VM-Server.git C:\AI-Tools\VM-Server
-   ```
-2. **Abhängigkeiten im venv installieren:**
-   ```powershell
-   C:\AI-Tools\AutoGen\venv\Scripts\pip.exe install -r C:\AI-Tools\VM-Server\requirements.txt
-   ```
-3. **Scheduled Task aktualisieren:**
-   Wir ändern die geplante Aufgabe `AutoGenProxy`, sodass sie das neue Skript `C:\AI-Tools\VM-Server\proxy.py` ausführt.
-   - Neuer Befehl: `C:\AI-Tools\AutoGen\venv\Scripts\python.exe -m uvicorn proxy:app --host 0.0.0.0 --port 4000`
-   - Startpfad (Working Directory): `C:\AI-Tools\VM-Server`
-4. **Task neu starten:**
-   ```powershell
-   Stop-ScheduledTask -TaskName AutoGenProxy
-   Start-ScheduledTask -TaskName AutoGenProxy
-   ```
+---
+
+## Entwicklungsmodell & Risiken
+
+> [!WARNING]
+> **Server = Entwicklungs- und Produktivumgebung gleichzeitig.**
+> Änderungen an `proxy.py` wirken sofort auf den laufenden Telegram-Bot. Es gibt kein Staging.
+
+**Workflow:**
+```
+Cowork / Claude (editiert Dateien auf Server)
+    → git add / commit / push (manuell via SSH)
+    → GitHub (steffensoldan/VM-Server)
+    → git pull auf lokaler Maschine (Synchronisierung)
+```
+
+**Schutzmaßnahmen:**
+- Vor jeder Änderung committen — dann ist ein Rollback möglich: `git revert HEAD`
+- Watchdog (`AutoGenProxyWatchdog`) startet den Dienst bei Absturz automatisch neu
+- Bei kritischen Änderungen: Task manuell stoppen, testen, dann wieder starten
+
+---
+
+## Deployment-Schritte (einmalig, als AI-Admin)
+
+### Firewall-Regel für Stirling PDF Web-UI
+Damit der Browser im ZEW-Netz `http://sts-w-0001.zew.local:8080` erreicht:
+
+```powershell
+New-NetFirewallRule `
+    -DisplayName "Stirling PDF Web-UI" `
+    -Direction Inbound `
+    -Action Allow `
+    -Protocol TCP `
+    -LocalPort 8080 `
+    -RemoteAddress "192.168.0.0/16" `
+    -Force
+```
+
+> `RemoteAddress` auf das ZEW-Subnetz einschränken — kein offener Port nach außen.
+
+### JAR deployen
+```powershell
+Expand-Archive -Path "<Pfad-zur-ZIP>" -DestinationPath "C:\AI-Tools\Stirling-PDF\app"
+# JAR umbenennen falls nötig:
+# Rename-Item "C:\AI-Tools\Stirling-PDF\app\Stirling-PDF-*.jar" "stirling-pdf.jar"
+```
+
+### Git pull + Task-Neustart
+```powershell
+git -C C:\AI-Tools\VM-Server pull
+schtasks /end /tn AutoGenProxy
+schtasks /run /tn AutoGenProxy
+```
+
+---
+
+## Offene Punkte (vor Deployment zu klären)
+
+| Punkt | Status |
+|---|---|
+| Stirling PDF API-Endpunkt für PDF→Excel | ⚠ ungesichert — nach Deployment verifizieren (`GET /api/v1/info`) |
+| Java-Pfad auf Server im PATH? | ⚠ offen — manuell prüfen |
+| Stirling PDF Startzeit (typ. 10–15s) | → Bot wartet und meldet wenn nicht bereit |
+| Telegram Dateilimit 50 MB | → im Bot abgefangen mit Fehlermeldung |
 
 ---
 
 ## Verification Plan
 
-### Automated Tests
-1. **Inferenz- und Codeausführungstest:** Aufruf des HTTP-Endpoints des Servers und Verifizierung, dass Qwen 2.5 3B Python-Code ausführt und Ergebnisse korrekt in UTF-8 zurückliefert.
-
-### Manual Verification
-- Test über den Webchat, um sicherzustellen, dass die Umlaut-Problematik und die Token-Zählung einwandfrei funktionieren.
+1. `proxy.py` startet ohne Fehler: Task-Log prüfen
+2. Stirling PDF erreichbar: `Invoke-RestMethod http://localhost:8080/api/v1/info`
+3. Telegram `/pdf-compress`: PDF senden → komprimiertes PDF zurück
+4. Telegram `/pdf-toexcel`: PDF senden → CSV/Excel zurück (Endpunkt validieren)
+5. Web-UI erreichbar: Browser auf `http://sts-w-0001.zew.local:8080`
