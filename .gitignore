@@ -1,0 +1,20 @@
+# Secrets — NIEMALS committen
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs (automatisch generiert, kein Mehrwert im Repo)
+stirling.log
+stirling_stderr.log
+*.log
+
+# Laufzeit-Dateien
+memory.json
+deploy.ps1
+
+# Stirling PDF JAR (223 MB, wird manuell deployt)
+*.jar
+Stirling-PDF/
